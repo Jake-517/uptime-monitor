@@ -1,0 +1,76 @@
+name: Uptime & SSL Monitor
+
+# Watches app.leaveitlovely.com and forecast.leaveitlovely.com from GitHub's
+# servers (fully external to Vercel and to Jake's Mac) every ~10 minutes.
+# Alerts the Slack #new-agreements webhook when:
+#   - a site is unreachable or not returning 200 (checked twice, 30s apart)
+#   - an SSL certificate can't be read (the July 14, 2026 outage signature)
+#   - a certificate is <14 days from expiry without having auto-renewed
+# No secrets live in this repo's code — the Slack webhook is an Actions secret.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Send a test Slack alert instead of a real check'
+        required: false
+        default: 'false'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Check sites + certificates
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          TEST_ALERT: ${{ github.event.inputs.test_alert }}
+        run: |
+          set -u
+          alert() {
+            curl -sS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"$1\"}" "$SLACK_WEBHOOK_URL" >/dev/null || true
+          }
+
+          if [ "${TEST_ALERT:-false}" = "true" ]; then
+            alert "✅ Uptime monitor test — the alert wiring works. This monitor now checks app + forecast every 10 minutes from GitHub's servers. (Not a real problem.)"
+            echo "test alert sent"
+            exit 0
+          fi
+
+          FAILED=0
+          for domain in app.leaveitlovely.com forecast.leaveitlovely.com; do
+            # ── availability: 2 tries, 30s apart, to avoid one-blip false alarms ──
+            ok=0
+            code=000
+            for attempt in 1 2; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "https://$domain/" || echo 000)
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              [ "$attempt" -eq 1 ] && sleep 30
+            done
+            if [ "$ok" -ne 1 ]; then
+              FAILED=1
+              alert "🚨 $domain is DOWN (HTTP $code). Confirmed twice, 30 seconds apart, from outside the network."
+              echo "::error::$domain down ($code)"
+              continue
+            fi
+            echo "$domain: HTTP 200 OK"
+
+            # ── certificate: readable + not about to lapse ──
+            enddate=$(echo | openssl s_client -servername "$domain" -connect "$domain:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+            if [ -z "$enddate" ]; then
+              FAILED=1
+              alert "🚨 $domain: SSL certificate could not be read — handshake failing (this is exactly what the July 14 outage looked like). Vercel → Domains → Refresh."
+              echo "::error::$domain cert unreadable"
+              continue
+            fi
+            days=$(( ( $(date -d "$enddate" +%s) - $(date +%s) ) / 86400 ))
+            echo "$domain: certificate valid for $days more days"
+            if [ "$days" -lt 14 ]; then
+              FAILED=1
+              alert "⚠️ $domain SSL certificate expires in $days days and has NOT auto-renewed. Renewal normally happens ~30 days out — fix before it lapses: Vercel → leave-it-lovely → Domains → Refresh."
+            fi
+          done
+          exit $FAILED
